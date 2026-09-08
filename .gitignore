@@ -258,3 +258,9 @@ dotnet/filtered-*.slnx
 
 **/issues/
 .test_*
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/pySourceRootDetection.xml
+/.idea/vcs.xml
+/.idea/workspace.xml
+/microsoft-agent-framework.iml
