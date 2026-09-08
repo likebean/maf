@@ -474,7 +474,7 @@ class DemoHandoffWorkflow(AgentFrameworkWorkflow):
         )
 
     async def run(self, input_data: dict[str, Any]) -> AsyncGenerator[Any]:
-        """Bind workflow_id,  resolve checkpoint on resume, then delegate to MAF AG-UI."""
+        """Bind workflow_id, resolve checkpoint on resume, then delegate to MAF AG-UI."""
 
         thread_id = self._thread_id_from_input(input_data)
         workflow_id = _workflow_id_from_input(input_data)
