@@ -14,7 +14,7 @@ interrupt id in ``pending_request_info_events`` and injects it into
 ``forwardedProps`` so the AG-UI / MAF stack can restore. Requests without
 ``resume`` run as a new workflow turn (no checkpoint).
 
-Also keeps ``LatestUserTurnWorkflow`` so snapshot reconstruction can be full
+Also keeps ``_with_latest_user_turn`` so snapshot reconstruction can be full
 while ``workflow.run(message=...)`` only sees the latest user turn.
 """
 
@@ -55,13 +55,18 @@ load_dotenv(BACKEND_DIR / ".env")
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:1234/v1"
-DEFAULT_OPENAI_MODEL = "qwen3.8-27b@4bit"
+DEFAULT_OPENAI_BASE_URL = "https://eloquent-reseal-viewless.ngrok-free.dev/v1"
+DEFAULT_OPENAI_MODEL = "cyankiwi/Qwen3.8-27B-AWQ-INT4"
 DEFAULT_SNAPSHOT_SCOPE = "local-demo"
 DEFAULT_WORKFLOW_ID = "handoff_support"
 WORKFLOW_NAME = "ag_ui_handoff2_workflow_demo"
 _CHECKPOINT_REQUEST_OWNER_KEY = "ag_ui_workflow_request_owner"
 _SNAPSHOT_SCOPE_INPUT_KEY = "__ag_ui_snapshot_scope"
+# Handoff HITL request payloads are pickled into checkpoints and must be allowlisted to reload.
+_ALLOWED_CHECKPOINT_TYPES = [
+    "agent_framework_orchestrations._handoff:HandoffAgentUserRequest",
+    "types:GenericAlias",
+]
 
 
 def _message_role(message: Message | Any) -> str | None:
@@ -83,22 +88,16 @@ def _latest_user_turn_messages(messages: Sequence[Message]) -> list[Message]:
     return list(messages[last_user:])
 
 
-class LatestUserTurnWorkflow:
-    """Forward only the latest user turn into ``workflow.run(message=...)``."""
+def _with_latest_user_turn(workflow: Workflow) -> Workflow:
+    """Patch ``workflow.run`` so AG-UI still receives a real ``Workflow`` instance.
 
-    def __init__(self, inner: Workflow) -> None:
-        object.__setattr__(self, "_inner", inner)
+    Full snapshot history can be reconstructed for the UI, while the handoff graph
+    only sees the latest user turn (plus any resume/checkpoint path unchanged).
+    """
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
+    original_run = workflow.run
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name == "_inner":
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self._inner, name, value)
-
-    def run(self, message: Any | None = None, **kwargs: Any) -> Any:
+    def run(message: Any | None = None, **kwargs: Any) -> Any:
         if (
             message is not None
             and kwargs.get("responses") is None
@@ -108,7 +107,10 @@ class LatestUserTurnWorkflow:
             and all(isinstance(item, Message) for item in message)
         ):
             message = _latest_user_turn_messages(cast(Sequence[Message], message))
-        return self._inner.run(message, **kwargs)
+        return original_run(message, **kwargs)
+
+    workflow.run = run  # type: ignore[method-assign]
+    return workflow
 
 
 @tool(approval_mode="always_require")
@@ -312,7 +314,7 @@ def build_handoff_support_workflow(*, db: DemoSqliteStore) -> Workflow:
             description="Route to refund specialist if the user pivots from replacement to refund processing.",
         )
     )
-    return LatestUserTurnWorkflow(builder.with_start_agent(triage).build())  # type: ignore[return-value]
+    return _with_latest_user_turn(builder.with_start_agent(triage).build())
 
 
 WORKFLOW_BUILDERS: dict[str, Callable[..., Workflow]] = {
@@ -545,7 +547,7 @@ def create_app() -> FastAPI:
     db_path = Path(os.getenv("AF_SQLITE_DB", str(data_dir / "handoff2.sqlite")))
     db = DemoSqliteStore(db_path)
     snapshot_store = SqliteAGUIThreadSnapshotStore(db)
-    checkpoint_storage = SqliteCheckpointStorage(db)
+    checkpoint_storage = SqliteCheckpointStorage(db, allowed_checkpoint_types=_ALLOWED_CHECKPOINT_TYPES)
 
     demo_workflow = DemoHandoffWorkflow(
         db=db,

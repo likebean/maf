@@ -19,7 +19,11 @@ Each AG-UI request:
    `pending_request_info_events`, injects `forwardedProps.checkpoint_id`, then runs
 4. Otherwise runs as a new turn (MAF handles restore only when `checkpoint_id` is present)
 
-Also keeps **`LatestUserTurnWorkflow`**: full snapshot for UI; only the latest user turn
+Frontend keeps `thread_id` in `localStorage` + `?thread_id=` and on load POSTs empty
+`messages` so the backend can **hydrate** from the Thread Snapshot (chat + pending
+interrupts). **Start New Case** allocates a new thread id.
+
+Also keeps **`_with_latest_user_turn`**: full snapshot for UI; only the latest user turn
 into `workflow.run(message=...)`.
 
 ## Ports

@@ -273,10 +273,19 @@ class SqliteCheckpointStorage:
 
             encoded_rows = await asyncio.to_thread(_list)
 
-        return [
-            WorkflowCheckpoint.from_dict(decode_checkpoint_value(item, allowed_types=self._allowed_types))
-            for item in encoded_rows
-        ]
+        checkpoints: list[WorkflowCheckpoint] = []
+        for item in encoded_rows:
+            try:
+                checkpoints.append(
+                    WorkflowCheckpoint.from_dict(decode_checkpoint_value(item, allowed_types=self._allowed_types))
+                )
+            except Exception:
+                logger.warning(
+                    "Skipping undecodable checkpoint while listing workflow_name=%s",
+                    workflow_name,
+                    exc_info=True,
+                )
+        return checkpoints
 
     async def delete(self, checkpoint_id: CheckpointID) -> bool:
         async with self._store._lock:

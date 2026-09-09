@@ -64,11 +64,51 @@ const DEFAULT_CASE_SNAPSHOT: CaseSnapshot = {
 const CLOSED_CASE_NOTICE =
   "Previous case is complete. Sending another message starts a new workflow instance on this thread.";
 
+const THREAD_STORAGE_KEY = "ag_ui_handoff2_thread_id";
+
 function randomId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
   }
   return `id-${Math.random().toString(16).slice(2)}`;
+}
+
+function readThreadIdFromUrl(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const value = new URLSearchParams(window.location.search).get("thread_id");
+  return value && value.trim() ? value.trim() : null;
+}
+
+function persistThreadId(threadId: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(THREAD_STORAGE_KEY, threadId);
+  const url = new URL(window.location.href);
+  if (url.searchParams.get("thread_id") !== threadId) {
+    url.searchParams.set("thread_id", threadId);
+    window.history.replaceState({}, "", url.toString());
+  }
+}
+
+function resolveInitialThreadId(): string {
+  const fromUrl = readThreadIdFromUrl();
+  if (fromUrl) {
+    persistThreadId(fromUrl);
+    return fromUrl;
+  }
+  if (typeof window !== "undefined") {
+    const stored = window.localStorage.getItem(THREAD_STORAGE_KEY);
+    if (stored && stored.trim()) {
+      persistThreadId(stored.trim());
+      return stored.trim();
+    }
+  }
+  const created = randomId();
+  persistThreadId(created);
+  return created;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -133,6 +173,47 @@ function extractTextFromMessagePayload(messagePayload: unknown): string {
   return "";
 }
 
+function normalizeIncomingInterrupt(item: Record<string, unknown>): Interrupt | null {
+  const id = String(item.id ?? "");
+  if (!id) {
+    return null;
+  }
+
+  // Canonical AG-UI Interrupt has no top-level `value`; MAF puts the request in metadata.
+  let value: unknown = item.value;
+  if (!isObject(value)) {
+    const metadata = getObject(item, "metadata");
+    const agentFramework = metadata ? getObject(metadata, "agent_framework", "agentFramework") : null;
+    if (agentFramework) {
+      const payload = isObject(agentFramework.value) ? agentFramework.value : agentFramework;
+      const message = getString(item, "message", "prompt") ?? getString(payload, "message", "prompt");
+      value = message ? { ...payload, message } : payload;
+    } else if (getString(item, "message", "prompt") || getString(item, "reason")) {
+      value = {
+        message: getString(item, "message", "prompt"),
+        reason: getString(item, "reason"),
+        tool_call_id: item.toolCallId ?? item.tool_call_id,
+        metadata,
+      };
+    }
+  }
+
+  return { id, value };
+}
+
+function extractInterruptsFromRunFinished(event: Record<string, unknown>): Interrupt[] {
+  const outcome = getObject(event, "outcome");
+  const fromOutcome = outcome ? getValue(outcome, "interrupts", "interrupt") : undefined;
+  const rawInterrupts = fromOutcome ?? getValue(event, "interrupts", "interrupt");
+  if (!Array.isArray(rawInterrupts)) {
+    return [];
+  }
+  return rawInterrupts
+    .filter((item): item is Record<string, unknown> => isObject(item))
+    .map(normalizeIncomingInterrupt)
+    .filter((item): item is Interrupt => item !== null);
+}
+
 function extractPromptFromInterrupt(interrupt: Interrupt, payload?: RequestInfoPayload): string {
   const interruptValue = interrupt.value;
   if (!isObject(interruptValue)) {
@@ -169,6 +250,70 @@ function extractPromptFromInterrupt(interrupt: Interrupt, payload?: RequestInfoP
   return "Provide the requested information to continue.";
 }
 
+function displayMessagesFromSnapshot(rawMessages: unknown[]): DisplayMessage[] {
+  const display: DisplayMessage[] = [];
+  for (const item of rawMessages) {
+    if (!isObject(item)) {
+      continue;
+    }
+    const roleRaw = getString(item, "role");
+    if (roleRaw === "tool") {
+      continue;
+    }
+    const role = normalizeRole(item.role);
+    if (role !== "user" && role !== "assistant" && role !== "system") {
+      continue;
+    }
+    const text = extractTextFromMessagePayload(item).trim();
+    if (!text) {
+      continue;
+    }
+    display.push({
+      id: String(item.id ?? randomId()),
+      role,
+      text,
+    });
+  }
+  return display;
+}
+
+function caseSnapshotFromMessagesAndInterrupts(
+  display: DisplayMessage[],
+  interrupts: Interrupt[],
+): Partial<CaseSnapshot> {
+  const next: Partial<CaseSnapshot> = {};
+  for (const interrupt of interrupts) {
+    const functionCall = extractFunctionCallFromInterrupt(interrupt);
+    const args = parseFunctionArguments(functionCall);
+    const orderId = getString(args, "order_id", "orderId");
+    const amount = getString(args, "amount");
+    if (orderId) {
+      next.orderId = orderId;
+    }
+    if (amount) {
+      next.refundAmount = amount;
+    }
+    if (functionCall && getString(functionCall, "name") === "submit_refund") {
+      next.refundApproved = "pending";
+    }
+  }
+
+  for (const message of display) {
+    if (message.role !== "assistant") {
+      continue;
+    }
+    const orderMatch = message.text.match(/\border(?:\s+id)?\s*[#: ]?\s*(\d{3,})\b/i);
+    if (orderMatch && !next.orderId) {
+      next.orderId = orderMatch[1];
+    }
+    const amountMatch = message.text.match(/\$\s?\d+(?:\.\d{2})?/);
+    if (amountMatch && !next.refundAmount) {
+      next.refundAmount = amountMatch[0].replace(/\s+/g, "");
+    }
+  }
+  return next;
+}
+
 function extractFunctionCallFromInterrupt(interrupt: Interrupt): Record<string, unknown> | null {
   if (!isObject(interrupt.value)) {
     return null;
@@ -178,7 +323,10 @@ function extractFunctionCallFromInterrupt(interrupt: Interrupt): Record<string, 
   if (isObject(maybeCall)) {
     return maybeCall;
   }
-  return null;
+
+  const nested = getObject(interrupt.value, "agent_framework", "agentFramework");
+  const nestedCall = nested ? getObject(nested, "function_call", "functionCall") : null;
+  return isObject(nestedCall) ? nestedCall : null;
 }
 
 function parseFunctionArguments(functionCall: Record<string, unknown> | null): Record<string, unknown> {
@@ -200,13 +348,17 @@ function parseFunctionArguments(functionCall: Record<string, unknown> | null): R
 }
 
 function interruptKind(interrupt: Interrupt): "approval" | "handoff_input" | "unknown" {
-  if (isObject(interrupt.value) && getString(interrupt.value, "type") === "function_approval_request") {
+  if (!isObject(interrupt.value)) {
+    return "unknown";
+  }
+  const type = getString(interrupt.value, "type");
+  if (type === "function_approval_request" || extractFunctionCallFromInterrupt(interrupt)) {
     return "approval";
   }
-  if (isObject(interrupt.value) && getObject(interrupt.value, "agent_response", "agentResponse")) {
+  if (getObject(interrupt.value, "agent_response", "agentResponse")) {
     return "handoff_input";
   }
-  if (isObject(interrupt.value) && getString(interrupt.value, "message", "prompt")) {
+  if (getString(interrupt.value, "message", "prompt") || getString(interrupt.value, "reason") === "input_required") {
     return "handoff_input";
   }
   return "unknown";
@@ -274,11 +426,14 @@ export default function App(): JSX.Element {
   const workflowId = import.meta.env.VITE_WORKFLOW_ID ?? "handoff_support";
   const endpoint = `${backendUrl.replace(/\/$/, "")}/handoff2_demo`;
 
-  const threadIdRef = useRef<string>(randomId());
+  const threadIdRef = useRef<string>(resolveInitialThreadId());
   const assistantMessageIndexRef = useRef<Record<string, number>>({});
   const activeRunIdRef = useRef<string | null>(null);
   const pendingUsageRef = useRef<UsageDiagnostics | null>(null);
   const caseClosedRef = useRef<boolean>(false);
+  const hydrateModeRef = useRef<boolean>(false);
+  const didHydrateRef = useRef<boolean>(false);
+  const hydrateMessagesRef = useRef<DisplayMessage[]>([]);
 
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [requestInfoById, setRequestInfoById] = useState<Record<string, RequestInfoPayload>>({});
@@ -313,6 +468,10 @@ export default function App(): JSX.Element {
     setIsApprovalModalOpen(false);
   }, [currentInterruptKind, currentInterrupt?.id]);
 
+  useEffect(() => {
+    persistThreadId(threadIdRef.current);
+  }, []);
+
   const pushMessage = (message: DisplayMessage): void => {
     setMessages((prev) => [...prev, message]);
   };
@@ -327,11 +486,14 @@ export default function App(): JSX.Element {
   };
 
   const resetConversationState = (): void => {
-    threadIdRef.current = randomId();
+    const nextThreadId = randomId();
+    threadIdRef.current = nextThreadId;
+    persistThreadId(nextThreadId);
     assistantMessageIndexRef.current = {};
     activeRunIdRef.current = null;
     pendingUsageRef.current = null;
     caseClosedRef.current = false;
+    hydrateModeRef.current = false;
 
     setMessages([]);
     setRequestInfoById({});
@@ -493,10 +655,25 @@ export default function App(): JSX.Element {
           }
         }
         break;
-      case "MESSAGES_SNAPSHOT":
-        // Intentionally ignored for chat rendering in this demo.
-        // AG-UI snapshots can contain full conversation history and cause replay duplication.
+      case "MESSAGES_SNAPSHOT": {
+        // Apply only during hydrate; live runs stream TEXT_MESSAGE_* instead.
+        if (!hydrateModeRef.current || !isObject(event)) {
+          break;
+        }
+        const rawMessages = getValue(event, "messages");
+        if (!Array.isArray(rawMessages)) {
+          break;
+        }
+        const display = displayMessagesFromSnapshot(rawMessages);
+        hydrateMessagesRef.current = display;
+        rebuildAssistantMessageIndex(display);
+        setMessages(display);
+
+        const closed = display.some((item) => item.role === "assistant" && isCaseCompleteText(item.text));
+        caseClosedRef.current = closed;
+        setIsCaseClosed(closed);
         break;
+      }
       case "TOOL_CALL_ARGS": {
         if (!isObject(event)) {
           break;
@@ -577,16 +754,7 @@ export default function App(): JSX.Element {
           pendingUsageRef.current = null;
         }
 
-        const rawInterrupts = isObject(event) ? getValue(event, "interrupt", "interrupts") : undefined;
-        const interruptPayload = Array.isArray(rawInterrupts)
-          ? rawInterrupts
-              .filter((item): item is Record<string, unknown> => isObject(item))
-              .map((item) => ({
-                id: String(item.id ?? ""),
-                value: item.value,
-              }))
-              .filter((item) => item.id.length > 0)
-          : [];
+        const interruptPayload = isObject(event) ? extractInterruptsFromRunFinished(event) : [];
 
         for (const interrupt of interruptPayload) {
           if (!isObject(interrupt.value)) {
@@ -610,8 +778,24 @@ export default function App(): JSX.Element {
         }
 
         setPendingInterrupts(interruptPayload);
+        if (hydrateModeRef.current) {
+          const current = hydrateMessagesRef.current;
+          const patch = caseSnapshotFromMessagesAndInterrupts(current, interruptPayload);
+          if (Object.keys(patch).length > 0) {
+            setCaseSnapshot((prev) => ({ ...prev, ...patch }));
+          }
+          const closed = current.some((item) => item.role === "assistant" && isCaseCompleteText(item.text));
+          caseClosedRef.current = closed;
+          setIsCaseClosed(closed);
+        }
         setStatusText(
-          interruptPayload.length > 0 ? "Waiting for input" : caseClosedRef.current ? "Case complete" : "Run complete"
+          interruptPayload.length > 0
+            ? "Waiting for input"
+            : caseClosedRef.current
+              ? "Case complete"
+              : hydrateModeRef.current
+                ? "Ready"
+                : "Run complete"
         );
         setIsRunning(false);
         break;
@@ -716,6 +900,31 @@ export default function App(): JSX.Element {
       setIsRunning(false);
     }
   };
+
+  const hydrateFromSnapshot = async (): Promise<void> => {
+    hydrateModeRef.current = true;
+    hydrateMessagesRef.current = [];
+    setStatusText("Hydrating");
+    try {
+      await runWithPayload({
+        thread_id: threadIdRef.current,
+        run_id: randomId(),
+        messages: [],
+      });
+    } finally {
+      hydrateModeRef.current = false;
+    }
+  };
+
+  useEffect(() => {
+    if (didHydrateRef.current) {
+      return;
+    }
+    didHydrateRef.current = true;
+    void hydrateFromSnapshot();
+    // Mount-only hydrate for the persisted thread id.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const startNewTurn = async (text: string): Promise<void> => {
     if (caseClosedRef.current && pendingInterrupts.length === 0) {
